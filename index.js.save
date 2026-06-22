@@ -1,0 +1,204 @@
+
+
+
+
+
+require("dotenv").config();
+con
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+xxst express = require("express");
+xxxconst axios = require("axios");
+
+const app = express();
+app.use(express.json());
+
+const processed = new Set();
+
+const STATUS = {
+  UNDELIVERED_A1: 9,
+  UNDELIVERED_A2: 14,
+  RTO_INITIATED: 17,
+};
+
+const BOLNA_AGENTS = {
+  DELAY: process.env.BOLNA_AGENT_DELAY,
+  ATTEMPT_1: process.env.BOLNA_AGENT_ATTEMPT_1,
+  ATTEMPT_2: process.env.BOLNA_AGENT_ATTEMPT_2,
+};
+
+async function triggerBolnaCall(agentId, recipientPhone, userData) {
+  if (!agentId) return console.warn(`[BOLNA] Agent ID missing`);
+  const response = await axios.post(
+    "https://api.bolna.ai/call",
+    {
+      agent_id: agentId,
+      recipient_phone_number: recipientPhone,
+      from_phone_number: process.env.BOLNA_FROM_NUMBER,
+      user_data: userData,
+    },
+    {
+      headers: {
+        Authorization: `Bearer ${process.env.BOLNA_API_KEY}`,
+        "Content-Type": "application/json",
+      },
+    }
+  );
+  console.log(`[BOLNA] Call triggered → agent=${agentId} call_id=${response.data?.call_id}`);
+}
+
+function isDelayed(etd, thresholdHours = 24) {
+  if (!etd) return false;
+  return (Date.now() - new Date(etd).getTime()) / 3600000 >= thresholdHours;
+}
+
+function getAttemptCount(scans = []) {
+  return scans.filter(
+    (s) => s.status === "UD" || (s.activity || "").toLowerCase().includes("undelivered")
+  ).length;
+}
+
+async function getCustomerPhone(srOrderId, awb) {
+  // Replace with your DB query
+  return process.env.TEST_CUSTOMER_PHONE || null;
+}
+
+app.post("/webhook/shiprocket", async (req, res) => {
+  const incomingToken = req.headers["x-api-key"];
+  if (incomingToken !== process.env.SHIPROCKET_WEBHOOK_SECRET) {
+    return res.status(401).json({ error: "Unauthorized" });
+  }
+
+  res.status(200).json({ received: true });
+
+  const {
+    awb, sr_order_id, order_id,
+    current_status, current_status_id,
+    courier_name, etd, scans = [],
+    customer_name, customer_phone,
+  } = req.body;
+
+  console.log(`[WEBHOOK] AWB=${awb} status=${current_status} (id=${current_status_id})`);
+
+  const recipientPhone = customer_phone || (await getCustomerPhone(sr_order_id, awb));
+  if (!recipientPhone) return console.error(`[ERROR] No phone for AWB ${awb}`);
+
+  const attemptCount = getAttemptCount(scans);
+  const eventKey = `${awb}:${current_status_id}:${attemptCount}`;
+  if (processed.has(eventKey)) return console.log(`[SKIP] Duplicate ${eventKey}`);
+  processed.add(eventKey);
+
+  const baseUserData = {
+    customer_name: customer_name || "there",
+    order_id: order_id || sr_order_id,
+    awb,
+    courier_name: courier_name || "our courier partner",
+    new_etd: etd ? new Date(etd).toLocaleDateString("en-IN", { day: "numeric", month: "short" }) : "soon",
+  };
+
+  if (isDelayed(etd, 24)) {
+    console.log(`[TRIGGER] DELAY — AWB ${awb}`);
+    return await triggerBolnaCall(BOLNA_AGENTS.DELAY, recipientPhone, baseUserData);
+  }
+
+  if (current_status_id === STATUS.UNDELIVERED_A1 || attemptCount === 1) {
+    console.log(`[TRIGGER] ATTEMPT 1 FAILED — AWB ${awb}`);
+    return setTimeout(async () => {
+      await triggerBolnaCall(BOLNA_AGENTS.ATTEMPT_1, recipientPhone, { ...baseUserData });
+    }, parseInt(process.env.A1_CALL_DELAY_MS || "7200000"));
+  }
+
+  if (current_status_id === STATUS.UNDELIVERED_A2 || attemptCount >= 2) {
+    console.log(`[TRIGGER] ATTEMPT 2 FAILED — AWB ${awb}`);
+    return setTimeout(async () => {
+      await triggerBolnaCall(BOLNA_AGENTS.ATTEMPT_2, recipientPhone, { ...baseUserData });
+    }, parseInt(process.env.A2_CALL_DELAY_MS || "3600000"));
+  }
+
+  console.log(`[SKIP] No trigger matched for status_id=${current_status_id}`);
+});
+
+app.get("/health", (_, res) => res.json({ status: "ok" }));
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`Server running on :${PORT}`));
