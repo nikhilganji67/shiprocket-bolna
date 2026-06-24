@@ -6,6 +6,8 @@ const app = express();
 app.use(express.json());
 
 const processed = new Set();
+let shiprocketToken = null;
+let tokenExpiry = null;
 
 const STATUS = {
   UNDELIVERED_A1: 9,
@@ -19,6 +21,41 @@ const BOLNA_AGENTS = {
   ATTEMPT_2: process.env.BOLNA_AGENT_ATTEMPT_2,
 };
 
+// ── Shiprocket Auth ───────────────────────────────────────────────
+async function getShiprocketToken() {
+  if (shiprocketToken && tokenExpiry && Date.now() < tokenExpiry) {
+    return shiprocketToken;
+  }
+  const res = await axios.post("https://apiv2.shiprocket.in/v1/external/auth/login", {
+    email: process.env.SHIPROCKET_EMAIL,
+    password: process.env.SHIPROCKET_PASSWORD,
+  });
+  shiprocketToken = res.data.token;
+  tokenExpiry = Date.now() + 9 * 24 * 60 * 60 * 1000; // 9 days
+  console.log("[SHIPROCKET] Token refreshed");
+  return shiprocketToken;
+}
+
+// ── Fetch customer details from Shiprocket ────────────────────────
+async function getCustomerDetails(orderId) {
+  try {
+    const token = await getShiprocketToken();
+    const res = await axios.get(
+      `https://apiv2.shiprocket.in/v1/external/orders/show/${orderId}`,
+      { headers: { Authorization: `Bearer ${token}` } }
+    );
+    const order = res.data.data;
+    return {
+      customer_name: order?.billing_customer_name || order?.customer_name || "Customer",
+      customer_phone: order?.billing_phone || order?.customer_phone || null,
+    };
+  } catch (e) {
+    console.error(`[SHIPROCKET] Failed to fetch order ${orderId}:`, e.response?.data || e.message);
+    return { customer_name: "Customer", customer_phone: null };
+  }
+}
+
+// ── Trigger Bolna Call ────────────────────────────────────────────
 async function triggerBolnaCall(agentId, recipientPhone, userData) {
   if (!agentId) return console.warn(`[BOLNA] Agent ID missing`);
   const response = await axios.post(
@@ -39,22 +76,20 @@ async function triggerBolnaCall(agentId, recipientPhone, userData) {
   console.log(`[BOLNA] Call triggered → agent=${agentId} call_id=${response.data?.call_id}`);
 }
 
+// ── Helpers ───────────────────────────────────────────────────────
 function isDelayed(etd, thresholdHours = 24) {
   if (!etd) return false;
   return (Date.now() - new Date(etd).getTime()) / 3600000 >= thresholdHours;
 }
 
 function getAttemptCount(scans = []) {
-  return scans.filter(
-    (s) => s.status === "UD" || (s.activity || "").toLowerCase().includes("undelivered")
-  ).length;
+  return scans.filter((s) => {
+    const activity = (s.activity || "").toLowerCase();
+    return activity.includes("undelivered") || activity.includes("delivery attempt failed") || activity.includes("unable to deliver");
+  }).length;
 }
 
-async function getCustomerPhone(srOrderId, awb) {
-  // Replace with your DB query
-  return process.env.TEST_CUSTOMER_PHONE || null;
-}
-
+// ── Webhook ───────────────────────────────────────────────────────
 app.post("/webhook/shiprocket", async (req, res) => {
   const incomingToken = req.headers["x-api-key"];
   if (incomingToken !== process.env.SHIPROCKET_WEBHOOK_SECRET) {
@@ -64,47 +99,59 @@ app.post("/webhook/shiprocket", async (req, res) => {
   res.status(200).json({ received: true });
 
   const {
-    awb, sr_order_id, order_id,
-    current_status, current_status_id,
-    courier_name, etd, scans = [],
-    customer_name, customer_phone,
+    awb,
+    order_id,
+    current_status,
+    current_status_id,
+    courier_name,
+    etd,
+    scans = [],
   } = req.body;
 
-  console.log(`[WEBHOOK] AWB=${awb} status=${current_status} (id=${current_status_id})`);
+  console.log(`[WEBHOOK] AWB=${awb} order=${order_id} status=${current_status} (id=${current_status_id})`);
 
-  const recipientPhone = customer_phone || (await getCustomerPhone(sr_order_id, awb));
-  if (!recipientPhone) return console.error(`[ERROR] No phone for AWB ${awb}`);
+  // Fetch customer details from Shiprocket
+  const { customer_name, customer_phone } = await getCustomerDetails(order_id);
+  if (!customer_phone) {
+    return console.error(`[ERROR] No phone found for order ${order_id}`);
+  }
 
+  console.log(`[CUSTOMER] ${customer_name} — ${customer_phone}`);
+
+  // Idempotency check
   const attemptCount = getAttemptCount(scans);
   const eventKey = `${awb}:${current_status_id}:${attemptCount}`;
   if (processed.has(eventKey)) return console.log(`[SKIP] Duplicate ${eventKey}`);
   processed.add(eventKey);
 
   const baseUserData = {
-    customer_name: customer_name || "there",
-    order_id: order_id || sr_order_id,
+    customer_name,
+    order_id,
     awb,
     courier_name: courier_name || "our courier partner",
     new_etd: etd ? new Date(etd).toLocaleDateString("en-IN", { day: "numeric", month: "short" }) : "soon",
     brand_name: "GoodFlip",
   };
 
+  // ── Trigger: DELAY ──
   if (isDelayed(etd, 24)) {
     console.log(`[TRIGGER] DELAY — AWB ${awb}`);
-    return await triggerBolnaCall(BOLNA_AGENTS.DELAY, recipientPhone, baseUserData);
+    return await triggerBolnaCall(BOLNA_AGENTS.DELAY, customer_phone, baseUserData);
   }
 
+  // ── Trigger: ATTEMPT 1 ──
   if (current_status_id === STATUS.UNDELIVERED_A1 || attemptCount === 1) {
     console.log(`[TRIGGER] ATTEMPT 1 FAILED — AWB ${awb}`);
     return setTimeout(async () => {
-      await triggerBolnaCall(BOLNA_AGENTS.ATTEMPT_1, recipientPhone, { ...baseUserData });
+      await triggerBolnaCall(BOLNA_AGENTS.ATTEMPT_1, customer_phone, baseUserData);
     }, parseInt(process.env.A1_CALL_DELAY_MS || "7200000"));
   }
 
+  // ── Trigger: ATTEMPT 2 ──
   if (current_status_id === STATUS.UNDELIVERED_A2 || attemptCount >= 2) {
     console.log(`[TRIGGER] ATTEMPT 2 FAILED — AWB ${awb}`);
     return setTimeout(async () => {
-      await triggerBolnaCall(BOLNA_AGENTS.ATTEMPT_2, recipientPhone, { ...baseUserData });
+      await triggerBolnaCall(BOLNA_AGENTS.ATTEMPT_2, customer_phone, baseUserData);
     }, parseInt(process.env.A2_CALL_DELAY_MS || "3600000"));
   }
 
