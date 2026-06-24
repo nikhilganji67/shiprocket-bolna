@@ -21,6 +21,25 @@ const BOLNA_AGENTS = {
   ATTEMPT_2: process.env.BOLNA_AGENT_ATTEMPT_2,
 };
 
+// ── Forward to existing webhook ───────────────────────────────────
+async function forwardWebhook(payload) {
+  try {
+    await axios.post(
+      process.env.FORWARD_WEBHOOK_URL,
+      payload,
+      {
+        headers: {
+          "x-api-key": process.env.FORWARD_WEBHOOK_TOKEN,
+          "Content-Type": "application/json",
+        },
+      }
+    );
+    console.log(`[FORWARD] Payload forwarded to existing webhook`);
+  } catch (e) {
+    console.error(`[FORWARD] Failed:`, e.response?.data || e.message);
+  }
+}
+
 // ── Shiprocket Auth ───────────────────────────────────────────────
 async function getShiprocketToken() {
   if (shiprocketToken && tokenExpiry && Date.now() < tokenExpiry) {
@@ -31,12 +50,12 @@ async function getShiprocketToken() {
     password: process.env.SHIPROCKET_PASSWORD,
   });
   shiprocketToken = res.data.token;
-  tokenExpiry = Date.now() + 9 * 24 * 60 * 60 * 1000; // 9 days
+  tokenExpiry = Date.now() + 9 * 24 * 60 * 60 * 1000;
   console.log("[SHIPROCKET] Token refreshed");
   return shiprocketToken;
 }
 
-// ── Fetch customer details from Shiprocket ────────────────────────
+// ── Fetch customer details ────────────────────────────────────────
 async function getCustomerDetails(orderId) {
   try {
     const token = await getShiprocketToken();
@@ -85,7 +104,11 @@ function isDelayed(etd, thresholdHours = 24) {
 function getAttemptCount(scans = []) {
   return scans.filter((s) => {
     const activity = (s.activity || "").toLowerCase();
-    return activity.includes("undelivered") || activity.includes("delivery attempt failed") || activity.includes("unable to deliver");
+    return (
+      activity.includes("undelivered") ||
+      activity.includes("delivery attempt failed") ||
+      activity.includes("unable to deliver")
+    );
   }).length;
 }
 
@@ -96,7 +119,11 @@ app.post("/webhook/shiprocket", async (req, res) => {
     return res.status(401).json({ error: "Unauthorized" });
   }
 
+  // Respond immediately
   res.status(200).json({ received: true });
+
+  // Forward to existing webhook first — fire and forget
+  forwardWebhook(req.body);
 
   const {
     awb,
